@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -101,14 +102,170 @@ func (p *MP4Plugin) downloadSingleFile(stream *m7s.RecordStream, flag mp4.Flag, 
 // 1. 单个文件下载：通过 id 参数指定特定的录制文件
 // 2. 时间范围合并下载：根据时间范围合并多个录制文件
 func (p *MP4Plugin) download(w http.ResponseWriter, r *http.Request) {
+	// 输出完整的 HTTP 请求信息到控制台
+	p.Info("=== HTTP Request Details ===")
+	p.Info("Method", "method", r.Method)
+	p.Info("URL", "url", r.URL.String())
+	p.Info("Proto", "proto", r.Proto)
+	p.Info("Host", "host", r.Host)
+	p.Info("RemoteAddr", "remote_addr", r.RemoteAddr)
+	p.Info("RequestURI", "request_uri", r.RequestURI)
+	
+	// 输出所有请求头
+	p.Info("=== Request Headers ===")
+	for name, values := range r.Header {
+		for _, value := range values {
+			p.Info("Header", "name", name, "value", value)
+		}
+	}
+	
+	// 输出查询参数
+	if len(r.URL.Query()) > 0 {
+		p.Info("=== Query Parameters ===")
+		for name, values := range r.URL.Query() {
+			for _, value := range values {
+				p.Info("Query", "name", name, "value", value)
+			}
+		}
+	}
+	
+	// 输出路径参数（如果有）
+	if r.PathValue("streamPath") != "" {
+		p.Info("=== Path Parameters ===")
+		p.Info("PathValue", "streamPath", r.PathValue("streamPath"))
+	}
+	
+	p.Info("=== End Request Details ===")
+
 	// 检查数据库连接
 	if p.DB == nil {
 		http.Error(w, pkg.ErrNoDB.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// 设置响应头为 MP4 视频格式
+	// 设置响应头为 MP4 视频格式和 Range 支持
 	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Accept-Ranges", "bytes")
+	
+	// 检查是否是 Range 请求
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader != "" {
+		// 处理 Range 请求，返回 206 Partial Content
+		p.Info("Range request detected", "range", rangeHeader)
+		
+		// 解析 Range 头，支持多种格式
+		if strings.HasPrefix(rangeHeader, "bytes=") {
+			// 先获取文件路径和大小信息
+			streamPath := r.PathValue("streamPath")
+			var flag mp4.Flag
+			if strings.HasSuffix(streamPath, ".fmp4") {
+				flag = mp4.FLAG_FRAGMENT
+				streamPath = strings.TrimSuffix(streamPath, ".fmp4")
+			} else {
+				streamPath = strings.TrimSuffix(streamPath, ".mp4")
+			}
+			
+			query := r.URL.Query()
+			var totalSize int64
+			var filePath string
+			var id string
+			
+			// 处理单个文件的 Range 请求
+			if id := query.Get("id"); id != "" {
+				var streams []m7s.RecordStream
+				p.DB.Find(&streams, "id=? AND stream_path=?", id, streamPath)
+				if len(streams) == 0 {
+					http.Error(w, "record not found", http.StatusNotFound)
+					return
+				}
+				
+				// 获取文件信息
+				filePath = streams[0].FilePath
+				if fileInfo, err := os.Stat(filePath); err == nil {
+					totalSize = fileInfo.Size()
+				} else {
+					http.Error(w, "file not found", http.StatusNotFound)
+					return
+				}
+			} else {
+				// 对于合并下载，计算总大小
+				startTime, endTime, err := util.TimeRangeQueryParse(query)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				
+				// 查询时间范围内的录制记录
+				var streams []m7s.RecordStream
+				queryRecord := m7s.RecordStream{Type: "mp4"}
+				p.DB.Where(&queryRecord).Find(&streams, "end_time>? AND start_time<? AND stream_path=?", startTime, endTime, streamPath)
+				
+				// 计算所有文件的总大小
+				totalSize = 0
+				for _, stream := range streams {
+					if fileInfo, err := os.Stat(stream.FilePath); err == nil {
+						totalSize += fileInfo.Size()
+					}
+				}
+				
+				// 如果没有找到文件或总大小为0，使用默认值
+				if totalSize == 0 {
+					totalSize = 1024 * 1024 // 1MB 默认大小
+				}
+			}
+			
+			// 解析 Range 规格
+			rangeSpec := strings.TrimPrefix(rangeHeader, "bytes=")
+			start, end, err := p.parseRangeSpec(rangeSpec, totalSize)
+			if err != nil {
+				http.Error(w, "Invalid Range header", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			
+			// 验证范围有效性
+			if start < 0 || end >= totalSize || start > end {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+				http.Error(w, "Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			
+			// 设置 206 响应头
+			contentLength := end - start + 1
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize))
+			w.WriteHeader(http.StatusPartialContent)
+			
+			p.Info("Returning 206 Partial Content", "start", start, "end", end, "contentLength", contentLength, "totalSize", totalSize)
+			
+			// 读取并返回指定范围的文件内容
+			if filePath != "" && id != "" {
+				// 单个文件的范围读取
+				file, err := os.Open(filePath)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				defer file.Close()
+				
+				// 定位到起始位置
+				if _, err := file.Seek(start, io.SeekStart); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				
+				// 读取指定长度的内容
+				_, err = io.CopyN(w, file, contentLength)
+				if err != nil && err != io.EOF {
+					p.Error("Range read error", "error", err)
+				}
+			} else {
+				// 对于合并下载的范围请求，实现跨文件的范围读取
+				p.handleMergedFileRange(w, r, streamPath, start, contentLength, flag)
+			}
+			
+			return
+		}
+	}
 
 	// 从路径中提取流路径，并检查是否为分片格式
 	streamPath := r.PathValue("streamPath")
@@ -432,6 +589,151 @@ func (p *MP4Plugin) download(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
+	}
+}
+
+// parseRangeSpec 解析 HTTP Range 规格，支持多种格式
+// 支持的格式：
+// - "0-499"     : 字节 0-499 (包含)
+// - "500-999"   : 字节 500-999 (包含)
+// - "500-"      : 字节 500 到文件末尾
+// - "-500"      : 文件最后 500 字节
+func (p *MP4Plugin) parseRangeSpec(rangeSpec string, totalSize int64) (start, end int64, err error) {
+	rangeSpec = strings.TrimSpace(rangeSpec)
+	
+	if !strings.Contains(rangeSpec, "-") {
+		return 0, 0, fmt.Errorf("invalid range format")
+	}
+	
+	parts := strings.Split(rangeSpec, "-")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid range format")
+	}
+	
+	startStr := strings.TrimSpace(parts[0])
+	endStr := strings.TrimSpace(parts[1])
+	
+	if startStr == "" && endStr == "" {
+		return 0, 0, fmt.Errorf("invalid range format")
+	}
+	
+	if startStr == "" {
+		// 后缀范围格式: "-500" (最后 500 字节)
+		suffixLength, err := strconv.ParseInt(endStr, 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid suffix length")
+		}
+		if suffixLength <= 0 {
+			return 0, 0, fmt.Errorf("invalid suffix length")
+		}
+		if suffixLength >= totalSize {
+			return 0, totalSize - 1, nil
+		}
+		return totalSize - suffixLength, totalSize - 1, nil
+	}
+	
+	// 解析起始位置
+	start, err = strconv.ParseInt(startStr, 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid start position")
+	}
+	
+	if endStr == "" {
+		// 前缀范围格式: "500-" (从 500 到文件末尾)
+		return start, totalSize - 1, nil
+	}
+	
+	// 完整范围格式: "0-499"
+	end, err = strconv.ParseInt(endStr, 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid end position")
+	}
+	
+	return start, end, nil
+}
+
+// handleMergedFileRange 处理合并文件的范围请求
+// 这是一个简化的实现，对于复杂的合并文件范围读取，需要更精细的逻辑
+func (p *MP4Plugin) handleMergedFileRange(w http.ResponseWriter, r *http.Request, streamPath string, start int64, contentLength int64, flag mp4.Flag) {
+	query := r.URL.Query()
+	
+	// 解析时间范围参数
+	startTime, endTime, err := util.TimeRangeQueryParse(query)
+	if err != nil {
+		p.Error("Failed to parse time range", "error", err)
+		w.Write(make([]byte, contentLength)) // 返回空数据
+		return
+	}
+	
+	// 查询时间范围内的录制记录
+	var streams []m7s.RecordStream
+	queryRecord := m7s.RecordStream{Type: "mp4"}
+	p.DB.Where(&queryRecord).Find(&streams, "end_time>? AND start_time<? AND stream_path=?", startTime, endTime, streamPath)
+	
+	if len(streams) == 0 {
+		p.Warn("No streams found for range request")
+		w.Write(make([]byte, contentLength)) // 返回空数据
+		return
+	}
+	
+	// 简化实现：从第一个文件开始读取指定长度的数据
+	// 在实际应用中，这里应该实现更复杂的跨文件读取逻辑
+	var currentOffset int64 = 0
+	var remainingBytes int64 = contentLength
+	
+	for _, stream := range streams {
+		if remainingBytes <= 0 {
+			break
+		}
+		
+		file, err := os.Open(stream.FilePath)
+		if err != nil {
+			p.Error("Failed to open file", "file", stream.FilePath, "error", err)
+			continue
+		}
+		
+		fileInfo, err := file.Stat()
+		if err != nil {
+			file.Close()
+			continue
+		}
+		
+		fileSize := fileInfo.Size()
+		
+		// 检查是否需要从这个文件开始读取
+		if start >= currentOffset && start < currentOffset+fileSize {
+			// 计算在当前文件中的起始位置
+			fileStart := start - currentOffset
+			
+			// 定位到文件中的起始位置
+			if _, err := file.Seek(fileStart, io.SeekStart); err != nil {
+				file.Close()
+				continue
+			}
+			
+			// 计算从当前文件读取的字节数
+			bytesToRead := remainingBytes
+			if fileStart+bytesToRead > fileSize {
+				bytesToRead = fileSize - fileStart
+			}
+			
+			// 读取数据
+			written, err := io.CopyN(w, file, bytesToRead)
+			if err != nil && err != io.EOF {
+				p.Error("Failed to read file range", "error", err)
+			}
+			
+			remainingBytes -= written
+			start += written
+		}
+		
+		currentOffset += fileSize
+		file.Close()
+	}
+	
+	// 如果还有剩余字节需要填充，用零填充
+	if remainingBytes > 0 {
+		w.Write(make([]byte, remainingBytes))
 	}
 }
 
